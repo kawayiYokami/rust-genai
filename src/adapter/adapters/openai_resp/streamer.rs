@@ -22,6 +22,14 @@ pub struct OpenAIRespStreamer {
 
 	in_progress_tool_calls: BTreeMap<usize, ToolCall>,
 	custom_tool_call_indexes: BTreeSet<usize>,
+
+	// -- Diagnostics for a stream that ends without a terminal event
+	/// Kind of the last SSE frame seen (`event` name, or the payload `type`).
+	last_frame_kind: Option<String>,
+	/// How many frames failed to deserialize into a known event.
+	parse_failure_count: usize,
+	/// Reason of the last deserialize failure, kept for the end-of-stream report.
+	last_parse_error: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -131,6 +139,9 @@ impl OpenAIRespStreamer {
 			captured_data: Default::default(),
 			in_progress_tool_calls: BTreeMap::new(),
 			custom_tool_call_indexes: BTreeSet::new(),
+			last_frame_kind: None,
+			parse_failure_count: 0,
+			last_parse_error: None,
 		}
 	}
 
@@ -204,10 +215,41 @@ impl futures::Stream for OpenAIRespStreamer {
 			match event {
 				Some(Ok(Event::Open)) => return Poll::Ready(Some(Ok(InterStreamEvent::Start))),
 				Some(Ok(Event::Message(message))) => {
+					let trimmed = message.data.trim();
+
+					// OpenAI Responses 以终态事件收尾；少数兼容端点改发 `[DONE]` 哨兵，
+					// 不认它就会把一条完整流误判成中途结束。
+					if trimmed == "[DONE]" {
+						if !self.done {
+							self.done = true;
+							let inter_stream_end = InterStreamEnd {
+								captured_usage: self.captured_data.usage.take(),
+								captured_stop_reason: self.captured_data.stop_reason.take().map(StopReason::from),
+								captured_text_content: self.captured_data.content.take(),
+								captured_reasoning_content: self.captured_data.reasoning_content.take(),
+								captured_tool_calls: self.captured_data.tool_calls.take(),
+								captured_thought_signatures: self.captured_data.thought_signatures.take(),
+								captured_thought_blocks: None,
+								captured_response_id: None,
+							};
+							return Poll::Ready(Some(Ok(InterStreamEvent::End(inter_stream_end))));
+						}
+						continue;
+					}
+
 					let stream_event: RespStreamEvent = match serde_json::from_str(&message.data) {
 						Ok(stream_event) => stream_event,
 						Err(serde_error) => {
-							// If we are in debug, we might want to know about this
+							// 丢掉一帧本身不致命，但丢掉终态事件会让流看起来是正常结束，
+							// 所以把失败次数与最后失败原因留下来，等 EOF 时一并报告。
+							self.parse_failure_count += 1;
+							self.last_parse_error = Some(serde_error.to_string());
+							self.last_frame_kind = Some(
+								serde_json::from_str::<Value>(trimmed)
+									.ok()
+									.and_then(|value| value.x_get_str("type").ok().map(str::to_string))
+									.unwrap_or_else(|| message.event.clone()),
+							);
 							tracing::warn!(
 								"OpenAIRespStreamer - fail to parse event (skipping). Cause: {serde_error}. Data: {}",
 								message.data
@@ -441,17 +483,33 @@ impl futures::Stream for OpenAIRespStreamer {
 				None => {
 					if !self.done {
 						self.done = true;
-						let inter_stream_end = InterStreamEnd {
-							captured_usage: self.captured_data.usage.take(),
-							captured_stop_reason: self.captured_data.stop_reason.take().map(StopReason::from),
-							captured_text_content: self.captured_data.content.take(),
-							captured_reasoning_content: self.captured_data.reasoning_content.take(),
-							captured_tool_calls: self.captured_data.tool_calls.take(),
-							captured_thought_signatures: None,
-							captured_thought_blocks: None,
-							captured_response_id: None,
+						// 没有终态事件就 EOF：这里必须报错。此前构造一个正常 End 顶过去，
+						// 会让中途断掉的流看起来是一次完整回复，上层既无法重试也留不下现场。
+						//
+						// 其中要把两种原因分开：流真的被切断，和终态帧到了却没能解析。
+						// 后者若也报「没有终态事件」，排查的人会去查网络，方向就错了。
+						let terminal_kind = self
+							.last_frame_kind
+							.as_deref()
+							.filter(|kind| is_terminal_kind(kind));
+						let reason = match terminal_kind {
+							Some(kind) => format!("the terminal event `{kind}` could not be parsed"),
+							None => "stream ended without a terminal event".to_string(),
 						};
-						return Poll::Ready(Some(Ok(InterStreamEvent::End(inter_stream_end))));
+						let detail = format!(
+							"{reason}: last_frame={}, frames_failed_to_parse={}{}",
+							self.last_frame_kind.as_deref().unwrap_or("none"),
+							self.parse_failure_count,
+							self.last_parse_error
+								.as_ref()
+								.map(|error| format!(", last_parse_error={error}"))
+								.unwrap_or_default(),
+						);
+						tracing::error!("OpenAIRespStreamer - {detail}");
+						return Poll::Ready(Some(Err(Error::StreamParse {
+							model_iden: self.options.model_iden.clone(),
+							serde_error: serde::de::Error::custom(detail),
+						})));
 					}
 					return Poll::Ready(None);
 				}
@@ -463,6 +521,12 @@ impl futures::Stream for OpenAIRespStreamer {
 }
 
 // region:    --- Support
+
+/// The events that legitimately end a Responses stream. A frame of one of these
+/// kinds that fails to parse still means the stream reached its end.
+fn is_terminal_kind(kind: &str) -> bool {
+	matches!(kind, "response.completed" | "response.failed" | "response.incomplete" | "error")
+}
 
 fn tool_call_from_item(item: &Value, arguments: String) -> ToolCall {
 	ToolCall {
