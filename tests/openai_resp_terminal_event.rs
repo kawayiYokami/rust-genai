@@ -2,6 +2,10 @@
 //! (`response.completed` / `failed` / `incomplete` / `error`), or `[DONE]` for
 //! endpoints that end with that sentinel. An EOF before any of them means the
 //! stream was cut: that must surface as an error, not as a finished reply.
+//!
+//! A missing *field* is not a missing *event*. A compatible backend that omits
+//! `model` from `response.completed` still finished its answer, and that answer
+//! must not be turned into a stream error.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener};
@@ -47,12 +51,11 @@ fn sse(events: &[serde_json::Value]) -> String {
 	sse_raw(&refs)
 }
 
-const TEXT_DELTA: &str =
-	r#"{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hi"}"#;
+const TEXT_DELTA: &str = r#"{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hi"}"#;
 
-/// Runs one stream and reports whether it ended normally, plus its error
-/// rendered as text when it did not.
-async fn run(body: String) -> (bool, Option<String>) {
+/// Runs one stream and reports whether it ended normally, the stop reason it
+/// carried when it did, plus its error rendered as text when it did not.
+async fn run(body: String) -> (bool, Option<String>, Option<String>) {
 	let port = serve(body);
 	let client = Client::builder().build().expect("client");
 	let target = ServiceTarget {
@@ -68,10 +71,14 @@ async fn run(body: String) -> (bool, Option<String>) {
 
 	let mut stream = response.stream;
 	let mut saw_end = false;
+	let mut stop_reason = None;
 	let mut error = None;
 	while let Some(event) = stream.next().await {
 		match event {
-			Ok(ChatStreamEvent::End(_)) => saw_end = true,
+			Ok(ChatStreamEvent::End(end)) => {
+				saw_end = true;
+				stop_reason = end.captured_stop_reason.map(|reason| format!("{reason:?}"));
+			}
 			Ok(_) => {}
 			Err(err) => {
 				error = Some(err.to_string());
@@ -79,13 +86,13 @@ async fn run(body: String) -> (bool, Option<String>) {
 			}
 		}
 	}
-	(saw_end, error)
+	(saw_end, error, stop_reason)
 }
 
 #[tokio::test]
 async fn stream_ending_without_terminal_event_is_an_error() {
 	// Content arrived, then the stream closed without `response.completed`.
-	let (saw_end, error) = run(sse_raw(&[TEXT_DELTA])).await;
+	let (saw_end, error, _) = run(sse_raw(&[TEXT_DELTA])).await;
 
 	assert!(!saw_end, "a cut stream must not end normally");
 	let error = error.expect("a cut stream must surface an error");
@@ -98,19 +105,21 @@ async fn stream_ending_without_terminal_event_is_an_error() {
 #[tokio::test]
 async fn done_marker_counts_as_terminal_event() {
 	// Some compatible endpoints end with `[DONE]` instead of `response.completed`.
-	let (saw_end, error) = run(sse_raw(&[TEXT_DELTA, "[DONE]"])).await;
+	let (saw_end, error, _) = run(sse_raw(&[TEXT_DELTA, "[DONE]"])).await;
 
-	assert!(error.is_none(), "`[DONE]` must not be treated as a cut stream: {error:?}");
+	assert!(
+		error.is_none(),
+		"`[DONE]` must not be treated as a cut stream: {error:?}"
+	);
 	assert!(saw_end, "`[DONE]` should produce a normal end");
 }
 
 #[tokio::test]
 async fn unparsable_terminal_event_is_reported_as_that_not_as_a_cut_stream() {
-	// The terminal frame arrived but failed to deserialize (missing `model`).
-	// That is not a cut stream, and the message must not say it is one.
-	let completed_without_model =
-		r#"{"type":"response.completed","response":{"id":"resp1","status":"completed"}}"#;
-	let (saw_end, error) = run(sse_raw(&[TEXT_DELTA, completed_without_model])).await;
+	// The terminal frame arrived but is structurally broken (`response` is not an
+	// object). That is not a cut stream, and the message must not say it is one.
+	let completed_broken = r#"{"type":"response.completed","response":"not-an-object"}"#;
+	let (saw_end, error, _) = run(sse_raw(&[TEXT_DELTA, completed_broken])).await;
 
 	assert!(!saw_end, "an unparsable terminal event must not end normally");
 	let error = error.expect("must surface an error");
@@ -121,6 +130,24 @@ async fn unparsable_terminal_event_is_reported_as_that_not_as_a_cut_stream() {
 	assert!(
 		error.contains("response.completed"),
 		"the error should name the frame kind, got: {error}"
+	);
+}
+
+#[tokio::test]
+async fn terminal_event_with_missing_fields_still_ends_normally() {
+	// Compatible backends omit `model` / `id` / `status` from `response.completed`.
+	// The answer already finished; a missing field must not discard it.
+	let completed_without_fields = r#"{"type":"response.completed","response":{"id":"resp1"}}"#;
+	let (saw_end, error, stop_reason) = run(sse_raw(&[TEXT_DELTA, completed_without_fields])).await;
+
+	assert!(
+		error.is_none(),
+		"a missing field must not fail a finished answer: {error:?}"
+	);
+	assert!(saw_end, "the stream should still end normally");
+	assert!(
+		stop_reason.is_none(),
+		"an omitted status must not be turned into a stop reason, got: {stop_reason:?}"
 	);
 }
 
@@ -136,8 +163,12 @@ async fn completed_response_ends_normally() {
 		}),
 		serde_json::json!({ "type": "response.completed", "response": { "id": "resp1", "status": "completed", "model": "gpt-5" } }),
 	];
-	let (saw_end, error) = run(sse(&events)).await;
+	let (saw_end, error, stop_reason) = run(sse(&events)).await;
 
 	assert!(error.is_none(), "a completed stream must not error: {error:?}");
 	assert!(saw_end, "a completed stream should end normally");
+	assert!(
+		stop_reason.as_deref().is_some_and(|reason| reason.contains("Completed")),
+		"a completed response should carry a Completed stop reason, got: {stop_reason:?}"
+	);
 }

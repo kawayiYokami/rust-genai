@@ -375,7 +375,13 @@ impl futures::Stream for OpenAIRespStreamer {
 
 						RespStreamEvent::ResponseCompleted { response } => {
 							self.done = true;
-							self.captured_data.stop_reason = Some(response.stop_reason_raw());
+							// `status` and `incomplete_details` now tolerate a missing field,
+							// so an empty stop reason means the backend gave neither. Drop it
+							// rather than hand an empty stop reason downstream.
+							let stop_reason_raw = response.stop_reason_raw();
+							if !stop_reason_raw.is_empty() {
+								self.captured_data.stop_reason = Some(stop_reason_raw);
+							}
 
 							if self.options.capture_usage {
 								self.captured_data.usage = response.usage.map(Into::into);
@@ -412,7 +418,7 @@ impl futures::Stream for OpenAIRespStreamer {
 								captured_tool_calls: self.captured_data.tool_calls.take(),
 								captured_thought_signatures: self.captured_data.thought_signatures.take(),
 								captured_thought_blocks: None,
-								captured_response_id: Some(response.id),
+								captured_response_id: (!response.id.is_empty()).then_some(response.id),
 							};
 
 							return Poll::Ready(Some(Ok(InterStreamEvent::End(inter_stream_end))));
@@ -434,12 +440,15 @@ impl futures::Stream for OpenAIRespStreamer {
 
 						RespStreamEvent::ResponseIncomplete { response } => {
 							self.done = true;
-							self.captured_data.stop_reason = Some(response.stop_reason_raw());
+							let stop_reason_raw = response.stop_reason_raw();
+							if !stop_reason_raw.is_empty() {
+								self.captured_data.stop_reason = Some(stop_reason_raw);
+							}
 							// A response cut short (e.g., by `max_output_tokens`) keeps the tool
 							// calls it streamed, a truncated call with its arguments as far as
 							// they got (left as a string when they do not parse).
 							self.capture_tool_calls(&response.output);
-							let resp_id = response.id.clone();
+							let resp_id = (!response.id.is_empty()).then_some(response.id);
 							let inter_stream_end = InterStreamEnd {
 								captured_usage: response.usage.map(Into::into),
 								captured_stop_reason: self.captured_data.stop_reason.take().map(StopReason::from),
@@ -448,7 +457,7 @@ impl futures::Stream for OpenAIRespStreamer {
 								captured_tool_calls: self.captured_data.tool_calls.take(),
 								captured_thought_signatures: None,
 								captured_thought_blocks: None,
-								captured_response_id: Some(resp_id),
+								captured_response_id: resp_id,
 							};
 
 							return Poll::Ready(Some(Ok(InterStreamEvent::End(inter_stream_end))));
@@ -493,10 +502,7 @@ impl futures::Stream for OpenAIRespStreamer {
 						// Keep the two causes apart: the stream really was cut, or the
 						// terminal frame arrived and failed to parse. Reporting the second one
 						// as a missing terminal event sends whoever reads it to the network.
-						let terminal_kind = self
-							.last_frame_kind
-							.as_deref()
-							.filter(|kind| is_terminal_kind(kind));
+						let terminal_kind = self.last_frame_kind.as_deref().filter(|kind| is_terminal_kind(kind));
 						let reason = match terminal_kind {
 							Some(kind) => format!("the terminal event `{kind}` could not be parsed"),
 							None => "stream ended without a terminal event".to_string(),
@@ -530,7 +536,10 @@ impl futures::Stream for OpenAIRespStreamer {
 /// The events that legitimately end a Responses stream. A frame of one of these
 /// kinds that fails to parse still means the stream reached its end.
 fn is_terminal_kind(kind: &str) -> bool {
-	matches!(kind, "response.completed" | "response.failed" | "response.incomplete" | "error")
+	matches!(
+		kind,
+		"response.completed" | "response.failed" | "response.incomplete" | "error"
+	)
 }
 
 fn tool_call_from_item(item: &Value, arguments: String) -> ToolCall {
