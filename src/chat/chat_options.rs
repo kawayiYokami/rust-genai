@@ -3,6 +3,7 @@ use crate::chat::CacheControl;
 use crate::chat::chat_req_response_format::ChatResponseFormat;
 use crate::chat::chat_req_tool_choice::ToolChoice;
 use crate::chat::frame_sink::{ChatFrameSink, FnSink, FrameCtx, RawFrameRef};
+use crate::chat::request_tap::RequestTap;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -75,6 +76,14 @@ pub struct ChatOptions {
 	/// provider data the normalized events do not model (e.g. Gemini `groundingMetadata`).
 	#[serde(skip)]
 	pub raw_frame_sink: Option<Arc<dyn ChatFrameSink>>,
+
+	/// Receives the final request of every call, right before it is sent (see [`RequestTap`]).
+	///
+	/// The request counterpart of `raw_frame_sink`: the library hands the url, headers and
+	/// payload over and keeps nothing. Set here to scope it to one call; set on the `Client`
+	/// (see `ClientBuilder::with_request_tap`) to cover every call.
+	#[serde(skip)]
+	pub request_tap: Option<Arc<dyn RequestTap>>,
 
 	/// Desired response format (e.g., `ChatResponseFormat::JsonMode` for OpenAI-style JSON mode).
 	///
@@ -209,6 +218,21 @@ impl ChatOptions {
 		F: Fn(&FrameCtx, RawFrameRef<'_>) + Send + Sync + 'static,
 	{
 		self.with_raw_frame_sink(FnSink::new(f))
+	}
+
+	/// Sets the request tap for this call, taking ownership of it.
+	///
+	/// To keep a handle on an accumulating tap, use `with_request_tap_arc` instead.
+	pub fn with_request_tap(mut self, tap: impl RequestTap + 'static) -> Self {
+		self.request_tap = Some(Arc::new(tap));
+		self
+	}
+
+	/// Sets the request tap from a shared handle, so the caller can read what it
+	/// captured once the call completes.
+	pub fn with_request_tap_arc(mut self, tap: Arc<dyn RequestTap>) -> Self {
+		self.request_tap = Some(tap);
+		self
 	}
 
 	/// Sets the stop sequences.
@@ -637,6 +661,12 @@ impl ChatOptionsSet<'_, '_> {
 		self.chat
 			.and_then(|chat| chat.raw_frame_sink.clone())
 			.or_else(|| self.client.and_then(|client| client.raw_frame_sink.clone()))
+	}
+
+	pub fn request_tap(&self) -> Option<Arc<dyn RequestTap>> {
+		self.chat
+			.and_then(|chat| chat.request_tap.clone())
+			.or_else(|| self.client.and_then(|client| client.request_tap.clone()))
 	}
 
 	pub fn response_format(&self) -> Option<&ChatResponseFormat> {

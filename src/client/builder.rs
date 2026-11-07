@@ -1,5 +1,5 @@
 use crate::adapter::AdapterKind;
-use crate::chat::ChatOptions;
+use crate::chat::{ChatOptions, RequestTap};
 use crate::resolver::{
 	AuthResolver, IntoAuthResolverFn, IntoModelMapperFn, IntoServiceTargetResolverFn, ModelMapper, ProviderConfig,
 	ServiceTargetResolver,
@@ -18,6 +18,7 @@ use std::sync::Arc;
 pub struct ClientBuilder {
 	web_client: Option<WebClient>,
 	config: Option<ClientConfig>,
+	request_tap: Option<Arc<dyn RequestTap>>,
 }
 
 /// Builder methods
@@ -38,6 +39,34 @@ impl ClientBuilder {
 	pub fn with_web_config(mut self, req_options: WebConfig) -> Self {
 		let client_config = self.config.get_or_insert_with(ClientConfig::default);
 		client_config.web_config = Some(req_options);
+		self
+	}
+
+	/// Set the client-level request tap: the final request of every chat, chat-stream and
+	/// embed call is handed to it right before it is sent (see [`RequestTap`]).
+	///
+	/// The library only hands the request over — it never writes, redacts or logs it. A tap
+	/// set here covers every call on this `Client`; a tap set per call via
+	/// [`ChatOptions::with_request_tap`] takes precedence for that call.
+	///
+	/// ```rust
+	/// # use genai::Client;
+	/// # use genai::chat::{CollectorRequestTap, RequestTap};
+	/// # let collector = std::sync::Arc::new(CollectorRequestTap::new());
+	/// let client = Client::builder()
+	///     .with_request_tap_arc(collector.clone())
+	///     .build()
+	///     .expect("client");
+	/// ```
+	pub fn with_request_tap(mut self, tap: impl RequestTap + 'static) -> Self {
+		self.request_tap = Some(Arc::new(tap));
+		self
+	}
+
+	/// Set the client-level request tap from a shared handle, so the caller can read what it
+	/// captured (see [`RequestTap`]).
+	pub fn with_request_tap_arc(mut self, tap: Arc<dyn RequestTap>) -> Self {
+		self.request_tap = Some(tap);
 		self
 	}
 }
@@ -163,7 +192,11 @@ impl ClientBuilder {
 			WebClient::from_reqwest_client(build_reqwest(reqwest_builder)?)
 		};
 
-		let inner = super::ClientInner { web_client, config };
+		let inner = super::ClientInner {
+			web_client,
+			config,
+			request_tap: self.request_tap,
+		};
 
 		Ok(Client { inner: Arc::new(inner) })
 	}

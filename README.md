@@ -84,6 +84,7 @@ println!("{}", chat_res.first_text().unwrap_or("NO ANSWER"));
 - Custom auth/API key (see [examples/c02-auth.rs](examples/c02-auth.rs))
 - Model aliases (see [examples/c03-mapper.rs](examples/c03-mapper.rs))
 - Custom endpoint, auth, and model identifier (see [examples/c06-target-resolver.rs](examples/c06-target-resolver.rs))
+- Request inspection: the final url, headers and payload of every chat, chat-stream and embed call are handed to a `RequestTap` before sending — the library never writes, redacts or logs them (see [docs/request_tap.md](docs/request_tap.md))
 - And much more
 
 [Examples](#examples) | [Thanks](BIG-THANKS.md) | [Library Focus](#library-focus) | [Changelog](CHANGELOG.md) | Provider Mapping: [ChatOptions](#chatoptions) | [Usage](#usage)

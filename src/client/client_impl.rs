@@ -1,9 +1,13 @@
 use crate::adapter::{AdapterDispatcher, AdapterKind, ServiceType, WebRequestData};
-use crate::chat::{ChatOptions, ChatOptionsSet, ChatRequest, ChatResponse, ChatStreamResponse};
+use crate::chat::{
+	ChatOptions, ChatOptionsSet, ChatRequest, ChatResponse, ChatStreamResponse, RequestCtx, RequestKind, RequestRef,
+	RequestTap,
+};
 use crate::client::ModelSpec;
 use crate::embed::{EmbedOptions, EmbedOptionsSet, EmbedRequest, EmbedResponse};
 use crate::resolver::{AuthData, ProviderConfig};
 use crate::{Client, Error, ModelIden, Result, ServiceTarget};
+use std::sync::Arc;
 
 /// High-level client APIs.
 impl Client {
@@ -130,6 +134,20 @@ impl Client {
 				headers = override_headers;
 			};
 
+			// -- Request tap: the request is final here (adapter-shaped payload, every header
+			//    merge and auth override applied) and nothing below changes it.
+			if let Some(tap) = self.resolved_chat_request_tap(&options_set) {
+				let ctx = RequestCtx::new(RequestKind::Chat, model.clone());
+				tap.on_request(
+					&ctx,
+					RequestRef {
+						url: &url,
+						headers: &headers,
+						payload: &payload,
+					},
+				);
+			}
+
 			let web_res = self
 				.web_client()
 				.do_post(&url, &headers, &payload)
@@ -219,6 +237,19 @@ impl Client {
 				url = override_url;
 				headers = override_headers;
 			};
+
+			// -- Request tap: the request is final here; `new_req_builder` only translates it.
+			if let Some(tap) = self.resolved_chat_request_tap(&options_set) {
+				let ctx = RequestCtx::new(RequestKind::ChatStream, model.clone());
+				tap.on_request(
+					&ctx,
+					RequestRef {
+						url: &url,
+						headers: &headers,
+						payload: &payload,
+					},
+				);
+			}
 
 			let reqwest_builder =
 				self.web_client()
@@ -332,6 +363,19 @@ impl Client {
 				headers = override_headers;
 			};
 
+			// -- Request tap: the request is final here (see the chat variant above).
+			if let Some(tap) = self.request_tap() {
+				let ctx = RequestCtx::new(RequestKind::Embed, model.clone());
+				tap.on_request(
+					&ctx,
+					RequestRef {
+						url: &url,
+						headers: &headers,
+						payload: &payload,
+					},
+				);
+			}
+
 			let web_res = self
 				.web_client()
 				.do_post(&url, &headers, &payload)
@@ -351,6 +395,11 @@ impl Client {
 		let result = crate::otel::span::record_embed_result(&otel_span, result);
 
 		result
+	}
+
+	/// Resolves the tap for a chat call: the per-call options win over the client-level tap.
+	fn resolved_chat_request_tap(&self, options_set: &ChatOptionsSet<'_, '_>) -> Option<Arc<dyn RequestTap>> {
+		options_set.request_tap().or_else(|| self.request_tap())
 	}
 }
 
@@ -459,5 +508,249 @@ mod tests {
 		assert!(raw_req.contains("x-client-only: from-client"), "raw_req: {raw_req}");
 		assert!(raw_req.contains("x-req-only: from-req"), "raw_req: {raw_req}");
 		assert!(raw_req.contains("x-shared: request"), "raw_req: {raw_req}");
+	}
+
+	// -- Request tap
+
+	use crate::chat::CollectorRequestTap;
+
+	fn header_value<'a>(headers: &'a Headers, name: &str) -> Option<&'a String> {
+		headers
+			.iter()
+			.find(|(k, _)| k.eq_ignore_ascii_case(name))
+			.map(|(_, v)| v)
+	}
+
+	fn chat_completion_body() -> String {
+		serde_json::json!({
+			"id": "chatcmpl-test",
+			"model": "gpt-test",
+			"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+			"choices": [{
+				"finish_reason": "stop",
+				"message": {"role": "assistant", "content": "hello"}
+			}]
+		})
+		.to_string()
+	}
+
+	#[tokio::test]
+	async fn test_request_tap_sees_final_chat_request() {
+		let captured = Arc::new(Mutex::new(String::new()));
+		let port = serve_json(chat_completion_body(), captured);
+		let collector = Arc::new(CollectorRequestTap::new());
+		let client_opts = ChatOptions::default().with_extra_headers(Headers::from(("x-client", "from-client")));
+		let config = ClientConfig::default().with_chat_options(client_opts);
+		let client = Client::builder()
+			.with_config(config)
+			.with_request_tap_arc(collector.clone())
+			.build()
+			.expect("client");
+		let target = ServiceTarget {
+			endpoint: Endpoint::from_owned(format!("http://127.0.0.1:{port}/v1/")),
+			auth: AuthData::Key("test-key".to_string()),
+			model: ModelIden::new(AdapterKind::OpenAI, "gpt-test"),
+		};
+		let options = ChatOptions::default()
+			.with_temperature(0.25)
+			.with_extra_headers(Headers::from(("x-call", "from-call")));
+
+		let _res = client
+			.exec_chat(target, ChatRequest::from_user("hi"), Some(&options))
+			.await
+			.expect("chat should succeed");
+
+		let captured = collector.take().expect("the tap should have seen the chat request");
+		assert_eq!(captured.ctx.kind, RequestKind::Chat);
+		assert_eq!(captured.ctx.model_iden.model_name.as_str(), "gpt-test");
+		assert_eq!(
+			captured.request.url,
+			format!("http://127.0.0.1:{port}/v1/chat/completions"),
+			"the adapter-shaped url, not the endpoint"
+		);
+		assert_eq!(
+			header_value(&captured.request.headers, "authorization").map(String::as_str),
+			Some("Bearer test-key"),
+			"adapter auth header should be in the snapshot"
+		);
+		assert_eq!(
+			header_value(&captured.request.headers, "x-client").map(String::as_str),
+			Some("from-client"),
+			"client-level extra_headers should be merged in"
+		);
+		assert_eq!(
+			header_value(&captured.request.headers, "x-call").map(String::as_str),
+			Some("from-call"),
+			"per-call extra_headers should be merged in"
+		);
+		assert_eq!(captured.request.payload["model"], "gpt-test");
+		assert_eq!(captured.request.payload["temperature"].as_f64(), Some(0.25));
+		assert!(
+			captured.request.payload["messages"]
+				.as_array()
+				.map(|messages| messages.len() == 1)
+				.unwrap_or(false),
+			"payload should carry the built messages: {}",
+			captured.request.payload
+		);
+	}
+
+	#[tokio::test]
+	async fn test_request_tap_sees_auth_request_override() {
+		let captured = Arc::new(Mutex::new(String::new()));
+		let port = serve_json(chat_completion_body(), captured);
+		let collector = Arc::new(CollectorRequestTap::new());
+		let client = Client::builder()
+			.with_request_tap_arc(collector.clone())
+			.build()
+			.expect("client");
+		let override_url = format!("http://127.0.0.1:{port}/custom-chat-path");
+		let target = ServiceTarget {
+			endpoint: Endpoint::from_static("http://127.0.0.1:1/unused/"),
+			auth: AuthData::RequestOverride {
+				url: override_url.clone(),
+				headers: Headers::from(("x-custom-auth", "override-secret")),
+			},
+			model: ModelIden::new(AdapterKind::OpenAI, "gpt-test"),
+		};
+
+		let _res = client
+			.exec_chat(target, ChatRequest::from_user("hi"), None)
+			.await
+			.expect("chat should succeed via RequestOverride");
+
+		let captured = collector.take().expect("the tap should have seen the chat request");
+		assert_eq!(
+			captured.request.url, override_url,
+			"the tap must run after the auth override, so it sees the overridden url"
+		);
+		assert_eq!(
+			header_value(&captured.request.headers, "x-custom-auth").map(String::as_str),
+			Some("override-secret")
+		);
+		assert!(
+			header_value(&captured.request.headers, "authorization").is_none(),
+			"the override replaces the adapter auth header"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_request_tap_sees_chat_stream_request() {
+		// The stream is lazy: nothing is sent during setup, so an unreachable endpoint is enough
+		// to prove the tap fires before the transport is even built.
+		let collector = Arc::new(CollectorRequestTap::new());
+		let client = Client::builder()
+			.with_request_tap_arc(collector.clone())
+			.build()
+			.expect("client");
+		let target = ServiceTarget {
+			endpoint: Endpoint::from_static("http://127.0.0.1:1/v1/"),
+			auth: AuthData::Key("test-key".to_string()),
+			model: ModelIden::new(AdapterKind::OpenAI, "gpt-test"),
+		};
+
+		let res = client
+			.exec_chat_stream(target, ChatRequest::from_user("hi"), None)
+			.await
+			.expect("stream setup should succeed");
+		drop(res);
+
+		let captured = collector.take().expect("the tap should have seen the stream request");
+		assert_eq!(captured.ctx.kind, RequestKind::ChatStream);
+		assert!(
+			captured.request.url.ends_with("/chat/completions"),
+			"unexpected url: {}",
+			captured.request.url
+		);
+		assert_eq!(
+			captured.request.payload["stream"],
+			serde_json::json!(true),
+			"the stream flag is part of the final payload"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_request_tap_sees_embed_request() {
+		let captured = Arc::new(Mutex::new(String::new()));
+		let body = serde_json::json!({
+			"data": [{"embedding": [0.1, 0.2], "index": 0}],
+			"model": "text-embedding-3-small",
+			"usage": {"prompt_tokens": 3, "total_tokens": 3}
+		})
+		.to_string();
+		let port = serve_json(body, captured);
+		let collector = Arc::new(CollectorRequestTap::new());
+		let client = Client::builder()
+			.with_request_tap_arc(collector.clone())
+			.build()
+			.expect("client");
+		let target = ServiceTarget {
+			endpoint: Endpoint::from_owned(format!("http://127.0.0.1:{port}/v1/")),
+			auth: AuthData::Key("test-key".to_string()),
+			model: ModelIden::new(AdapterKind::OpenAI, "text-embedding-3-small"),
+		};
+
+		let _res = client
+			.exec_embed(target, EmbedRequest::new("hello"), None)
+			.await
+			.expect("embed should succeed");
+
+		let captured = collector.take().expect("the tap should have seen the embed request");
+		assert_eq!(captured.ctx.kind, RequestKind::Embed);
+		assert!(
+			captured.request.url.ends_with("/embeddings"),
+			"unexpected url: {}",
+			captured.request.url
+		);
+		assert_eq!(captured.request.payload["input"], "hello");
+	}
+
+	#[tokio::test]
+	async fn test_request_tap_per_call_wins_over_client_tap() {
+		let captured = Arc::new(Mutex::new(String::new()));
+		let port = serve_json(chat_completion_body(), captured);
+		let client_collector = Arc::new(CollectorRequestTap::new());
+		let call_collector = Arc::new(CollectorRequestTap::new());
+		let client = Client::builder()
+			.with_request_tap_arc(client_collector.clone())
+			.build()
+			.expect("client");
+		let target = ServiceTarget {
+			endpoint: Endpoint::from_owned(format!("http://127.0.0.1:{port}/v1/")),
+			auth: AuthData::Key("test-key".to_string()),
+			model: ModelIden::new(AdapterKind::OpenAI, "gpt-test"),
+		};
+		let options = ChatOptions::default().with_request_tap_arc(call_collector.clone());
+
+		let _res = client
+			.exec_chat(target, ChatRequest::from_user("hi"), Some(&options))
+			.await
+			.expect("chat should succeed");
+
+		assert!(call_collector.take().is_some(), "the per-call tap should have seen it");
+		assert!(
+			client_collector.is_empty(),
+			"the client-level tap is replaced by the per-call one, not called as well"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_request_tap_absent_does_nothing() {
+		// A client with no tap must behave exactly as before: no panic, no extra work.
+		let captured = Arc::new(Mutex::new(String::new()));
+		let port = serve_json(chat_completion_body(), captured);
+		let client = Client::builder().build().expect("client");
+		let target = ServiceTarget {
+			endpoint: Endpoint::from_owned(format!("http://127.0.0.1:{port}/v1/")),
+			auth: AuthData::Key("test-key".to_string()),
+			model: ModelIden::new(AdapterKind::OpenAI, "gpt-test"),
+		};
+
+		let res = client
+			.exec_chat(target, ChatRequest::from_user("hi"), None)
+			.await
+			.expect("chat should succeed without any tap");
+
+		assert_eq!(res.first_text(), Some("hello"));
 	}
 }

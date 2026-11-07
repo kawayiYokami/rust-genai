@@ -15,6 +15,7 @@ mod content_part;
 mod frame_sink;
 mod json_schema;
 mod message_content;
+mod request_tap;
 mod tool;
 mod usage;
 
@@ -31,6 +32,7 @@ pub use content_part::*;
 pub use frame_sink::*;
 pub use json_schema::*;
 pub use message_content::*;
+pub use request_tap::*;
 pub use tool::*;
 pub use usage::*;
 

@@ -1,3 +1,4 @@
+use crate::chat::RequestTap;
 use crate::webc::WebClient;
 use crate::{ClientBuilder, ClientConfig, Result};
 use std::sync::Arc;
@@ -40,6 +41,11 @@ impl Client {
 	pub(crate) fn config(&self) -> &ClientConfig {
 		&self.inner.config
 	}
+
+	/// The client-level request tap, if one was set on the builder.
+	pub(crate) fn request_tap(&self) -> Option<Arc<dyn RequestTap>> {
+		self.inner.request_tap.clone()
+	}
 }
 
 // endregion: --- Client Getters
@@ -51,6 +57,9 @@ pub(super) struct ClientInner {
 	pub(super) web_client: WebClient,
 
 	pub(super) config: ClientConfig,
+
+	/// Receives the final request of every call (see [`RequestTap`]).
+	pub(super) request_tap: Option<Arc<dyn RequestTap>>,
 }
 
 // endregion: --- ClientInner
